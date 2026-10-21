@@ -13,7 +13,7 @@ import multiprocessing as mp
 import random as rand
 from collections import defaultdict
 
-from copy import deepcopy
+from copy import copy
 from multiprocessing import Lock, Value, Pool, Manager
 import numpy as np
 import math
@@ -23,6 +23,7 @@ from bisect import bisect_left
 from decifer.parse_args import args
 from decifer.fileio import write_results, write_results_CIs, read_in_state_trees, write_model_selection_results
 from decifer.new_coordinate_ascent import coordinate_descent, objective, compute_pdfs
+from decifer.fastmodel import Model
 from decifer.mutation import create_mutations
 from decifer.process_input import PURITY, MUTATION_DF
 from decifer.progress_bar import ProgressBar
@@ -61,6 +62,9 @@ def main():
         get_index = {v : k for k,v in sample_ids.items()}
         betabinomial = {get_index[sam] : betabinom_out[sam][0] for sam in betabinom_out.keys()}
 
+    # precompute the likelihood coefficients of every mutation and genotype tree (see fastmodel.py)
+    model = Model(mutations, PURITY, betabinomial if args['betabinomial'] else None)
+
     """
     # This is to print state trees and likelihoods for truncal cluster for each mutation, for debugging
     sample = 0 
@@ -85,12 +89,12 @@ def main():
         record = manager.list()
     if not args['iterative']:
         print("Using binary-search model selection")
-        run_coordinator_binary(mutations, num_samples, PURITY, args,
+        run_coordinator_binary(mutations, model, sample_ids, num_samples, PURITY, args,
                                record if args['record'] else None,
                                betabinomial if args['betabinomial'] else None)
     else:
         print("Using iterative model selection")
-        run_coordinator_iterative(mutations, sample_ids, num_samples, PURITY, args,
+        run_coordinator_iterative(mutations, model, sample_ids, num_samples, PURITY, args,
                                   record if args['record'] else None,
                                   betabinomial if args['betabinomial'] else None)
     if args['record']:
@@ -99,31 +103,17 @@ def main():
             for r in record:
                 o.write('{}\t{}\t{}\t{}\t{}\n'.format(r[0], r[1], r[2], r[3], r[4]))
 
-def run_coordinator_iterative(mutations, sample_ids, num_samples, PURITY, args, record, betabinomial):
+def run_coordinator_iterative(mutations, model, sample_ids, num_samples, PURITY, args, record, betabinomial):
     mink, maxk, maxit, prefix, restarts, ubleft, J = unpck(args)
     jobs = [(x, k, np.random.randint(low=0, high=2**10)) for x in range(restarts) for k in range(mink, maxk+1)]
-    # run in single-thread mode for development/debugging
-    if args['debug']:
-        shared = defaultdict(dict)
-        # make objects global
-        init_descent(mutations, num_samples, maxit, shared, record, betabinomial, PURITY)
-        for job in jobs:
-            run_descent(job)
-    else:
-        manager, shared = setup_shared()
-        initargs = (mutations, num_samples, maxit, shared, record, betabinomial, PURITY)
-        pool = Pool(processes=min(J, len(jobs)), initializer=init_descent, initargs=initargs)
-        bar = ProgressBar(total=len(jobs), length=30, verbose=False, lock=Lock(), counter=Value('i', 0))
-        bar.progress(advance=False, msg="Started")
-        report = (lambda r : bar.progress(advance=True, msg="Completed {} for k={} [Iterations: {}]".format(r[0], r[1], r[3])))
-        list(map(report, pool.imap_unordered(run_descent, jobs)))
+    results = run_descents(jobs, model, num_samples, maxit, record, PURITY, J, args['debug'], args['convergence'])
     # best[cluster number k] = min objective across runs/restarts
-    best = {k : min(list(filter(lambda j : j[1] == k, jobs)), key=(lambda j : shared['objs'][j])) for k in range(mink, maxk+1)}
+    best = {k : min(list(filter(lambda j : j[1] == k, jobs)), key=(lambda j : results[j][4])) for k in range(mink, maxk+1)}
 
     # Select the best number of clusters given the range of clusters from mink to maxk
-    objs = {k: shared['objs'][best[k]] for k in best}
+    objs = {k: results[best[k]][4] for k in best}
     if args['silhouette']:
-        selected, silhouette_scores = silhouette_model_selection(shared, best, mink, maxk)
+        selected, silhouette_scores = silhouette_model_selection({k : unpack_result(mutations, results[best[k]])[1] for k in best}, mink, maxk)
         write_model_selection_results(mink, maxk, objs, silhouette_scores, selected, prefix, args['silhouette'])
     else:
         selected, objs, elbow = elbow_criteria_model_selection(objs, best, mink, maxk, ubleft)
@@ -134,19 +124,7 @@ def run_coordinator_iterative(mutations, sample_ids, num_samples, PURITY, args, 
     else:
         k_to_print = [ selected ]
     for k in k_to_print:
-        C, bmut, clus, conf, objs = map(lambda D : shared[D][best[k]], ['C', 'bmut', 'clus', 'conf', 'objs'])
-        # C is list of lists; rows are samples, columns are cluster IDs, values are CCFs
-
-        bmut_HQ, bmut_LQ = filter_poorly_fit_SNVs(C, bmut, args['vafdevfilter'])
-
-        #CIs = [[()]*len(C[i]) for i in range(len(C))] # list of lists to store CIs, same structure as C
-        CIs, PDFs = compute_CIs_mp(set(clus), bmut_HQ, num_samples, betabinomial, J, C, args['debug'], args['conservativeCIs'])
-
-        write_results_CIs(prefix, num_samples, clus, sample_ids, CIs, args['printallk'], k)
-        write_results(prefix, C, CIs, conf, bmut_HQ, PURITY, betabinomial, 'CCF' if args['ccf'] else 'DCF', args['printallk'], k)
-        # write low quality mutations to a separate file
-        if len(bmut_LQ) > 0:
-            write_results(prefix + "_Outliers", C, CIs, conf, bmut_LQ, PURITY, betabinomial, 'CCF' if args['ccf'] else 'DCF', args['printallk'], k)
+        finalize_k(mutations, model, results[best[k]], sample_ids, num_samples, PURITY, args, betabinomial, k)
 
     """
     # FOR TESTING
@@ -167,10 +145,29 @@ def run_coordinator_iterative(mutations, sample_ids, num_samples, PURITY, args, 
                 f.write("\n")
     """
 
-def silhouette_model_selection(shared, best, mink, maxk):
+def finalize_k(mutations, model, result, sample_ids, num_samples, PURITY, args, betabinomial, k):
+    # filters poorly fit SNVs, computes cluster CIs and writes the results of the run_descent result for k clusters
+    prefix, J = args['output'], args['J']
+    C, bmut, clus, conf, objs = unpack_result(mutations, result)
+    # C is list of lists; rows are samples, columns are cluster IDs, values are CCFs
+
+    bmut_HQ, bmut_LQ = filter_poorly_fit_SNVs(C, bmut, args['vafdevfilter'])
+
+    #CIs = [[()]*len(C[i]) for i in range(len(C))] # list of lists to store CIs, same structure as C
+    CIs, PDFs = compute_CIs_mp(set(clus), bmut_HQ, num_samples, model, J, C, args['debug'], args['conservativeCIs'])
+
+    write_results_CIs(prefix, num_samples, clus, sample_ids, CIs, args['printallk'], k)
+    write_results(prefix, C, CIs, conf, bmut_HQ, PURITY, betabinomial, 'CCF' if args['ccf'] else 'DCF', args['printallk'], k, model)
+    # write low quality mutations to a separate file
+    if len(bmut_LQ) > 0:
+        write_results(prefix + "_Outliers", C, CIs, conf, bmut_LQ, PURITY, betabinomial, 'CCF' if args['ccf'] else 'DCF', args['printallk'], k, model)
+
+
+def silhouette_model_selection(bmut, mink, maxk):
+    # bmut[k] = assigned mutations of the best restart for k clusters
     silhouette_scores = {}
     for k in range(mink, maxk + 1):
-        mutations = shared['bmut'][best[k]]
+        mutations = bmut[k]
         X, labels = [], []
         for mut in mutations:
             # don't use mutations that couldn't be assigned to any cluster
@@ -258,32 +255,35 @@ def print_PDF(cluster_ids, muts, num_samples, bb, C):
                 f.write("\n")
 
 
-def compute_CIs_mp(cluster_ids, muts, num_samples, bb, J, C, debug, conservativeCIs):
+def compute_CIs_mp(cluster_ids, muts, num_samples, model, J, C, debug, conservativeCIs):
     CIs = [[()]*len(C[i]) for i in range(len(C))] # list of lists to store CIs, same structure as C
     PDFs = [[()]*len(C[i]) for i in range(len(C))] # list of lists to store CIs, same structure as C
     num_tests = float(len(cluster_ids)*num_samples) # bonferroni correction for multiple hypothesis testing
     #C[s][i] is the putative mode of the pdf
 
     CI_fun = CI_conservative if conservativeCIs == True else CI
+    jobs = [(c, s, num_tests) for c in cluster_ids for s in range(num_samples)]
     if debug:
         # single-thread mode for debugging
-        for c in cluster_ids:
-            for s in range(num_samples):
-                clust, samp, lower, upper, pdf = CI_fun( (c, s, muts, num_tests, bb) )
-                CIs[samp][clust] = (lower, upper)
-                PDFs[samp][clust] = pdf
+        init_CI(muts, model)
+        results = map(CI_fun, jobs)
     else:
-        jobs = [(c, s, muts, num_tests, bb) for c in cluster_ids for s in range(num_samples)]
-        pool = Pool(processes=min(J, len(jobs)))
-        results = pool.imap_unordered(CI_fun, jobs)
-        pool.close()
-        pool.join()
-        for i in results:
-            clust, samp, lower, upper, pdf = i[0], i[1], i[2], i[3], i[4]
-            CIs[samp][clust] = (lower,upper)
-            PDFs[samp][clust] = pdf
+        with Pool(processes=min(J, len(jobs)), initializer=init_CI, initargs=(muts, model)) as pool:
+            results = list(pool.imap_unordered(CI_fun, jobs))
+    for clust, samp, lower, upper, pdf in results:
+        CIs[samp][clust] = (lower, upper)
+        PDFs[samp][clust] = pdf
 
-    return CIs, PDFs 
+    return CIs, PDFs
+
+
+def init_CI(_muts, _model):
+    # mutations (with assignments) and the rows of their assigned genotype trees in the model
+    global ci_muts, ci_model, ci_rows, ci_clus
+    ci_muts = _muts
+    ci_model = _model
+    ci_rows = _model.assigned_rows(_muts)
+    ci_clus = np.array([m.assigned_cluster for m in _muts], dtype=np.int64)
 
 def CI(job):
     """
@@ -301,14 +301,15 @@ def CI(job):
     Thus, we have used a brute force method where we sample num_pts from the objective function, and use these to create and cahracterize the PDF of
     the CCF/DCF distribution.
     """
-    c, s, muts, num_tests, bb = job # c is cluster, s is sample
-    mut = list(filter(lambda m : m.assigned_cluster == c, muts))
-    
+    c, s, num_tests = job # c is cluster, s is sample
+    rows = ci_rows[ci_clus == c]
+
     num_pts = 10000
-    if len(mut) == 0:
+    if len(rows) == 0:
         l, u, pdf = "NaN", "Nan", ["Nan"]*num_pts
     else:
-        grid = [objective(j, mut, s, bb) for j in np.linspace(0, PURITY[s], num_pts)]
+        # objective(j, mut, s, bb) for every grid point j, vectorized
+        grid = ci_model.objective_grid(np.linspace(0, PURITY[s], num_pts), s, rows).tolist()
         min_log = min(grid)
         delta = (-1*min_log)-2      # constant to make -log(pdf) values less negative
         prob = (lambda x: math.exp(-1*(x+delta)))           # convert -log(pdf) to unnormalized probability
@@ -335,8 +336,8 @@ def CI_conservative(job):
     values and use bootstrap resampling to calculate CIs. To be conservative, we use the minimum and maximum observed
     median across bootstrap replicates, instead of the medians that correspond to e.g. 0.025 and 0.975 quantiles.
     """
-    c, s, muts, num_tests, bb = job  # c is cluster, s is sample
-    mut = list(filter(lambda m: m.assigned_cluster == c, muts))
+    c, s, num_tests = job  # c is cluster, s is sample
+    mut = list(filter(lambda m: m.assigned_cluster == c, ci_muts))
     bootstrap_reps = 10000
 
     # get DCF point values for cluster
@@ -345,15 +346,43 @@ def CI_conservative(job):
         vaf = m.a[s]/m.d[s]
         cf_point_vals.append( m.assigned_config.v_to_cf(vaf, s, truncate=False)/PURITY[s] )
 
-    median_boot_reps = [np.median(rand.choices(cf_point_vals, k=len(cf_point_vals))) for i in range(bootstrap_reps)]
-    low_CI = np.quantile(median_boot_reps, 0.0)
-    hi_CI = np.quantile(median_boot_reps, 1.0)
+    median_boot_reps = bootstrap_medians(cf_point_vals, bootstrap_reps)
+    # python floats, so that the CI tuples print the same with numpy 2
+    low_CI = float(np.quantile(median_boot_reps, 0.0))
+    hi_CI = float(np.quantile(median_boot_reps, 1.0))
     if low_CI == 1.0:
         low_CI = 0.999
     if hi_CI == 0.0:
         hi_CI = 0.001
 
     return (c, s, low_CI, hi_CI, [None])
+
+def bootstrap_medians(values, reps, max_elements=1000000):
+    """
+    Medians of `reps` bootstrap resamples of `values`, identical to
+        [np.median(rand.choices(values, k=len(values))) for i in range(reps)]
+    including the draws from (and the final state of) the global `random` generator, but vectorized:
+    numpy's legacy MT19937 RandomState produces the same doubles as random.random() from the same state,
+    and rand.choices picks values[floor(random() * n)].
+    """
+    n = len(values)
+    if n == 0:
+        return [np.median(rand.choices(values, k=0)) for i in range(reps)]
+    values = np.asarray(values, dtype=float)
+    version, internal, gauss_next = rand.getstate()
+    generator = np.random.RandomState()
+    generator.set_state(('MT19937', np.array(internal[:-1], dtype=np.uint32), internal[-1]))
+    medians = np.empty(reps)
+    step = max(1, max_elements // n)
+    for start in range(0, reps, step):
+        m = min(step, reps - start)
+        # row i holds the n draws of replicate start + i, in the order rand.choices makes them
+        idx = np.floor(generator.random_sample((m, n)) * float(n)).astype(np.int64)
+        medians[start:start + m] = np.median(values[idx], axis=1)
+    _, key, pos, _, _ = generator.get_state()
+    rand.setstate((version, tuple(int(k) for k in key) + (int(pos),), gauss_next))
+    return medians
+
 
 def take_closest(myList, myNumber):
     """
@@ -372,14 +401,16 @@ def take_closest(myList, myNumber):
     else:
         return pos-1
 
-def run_coordinator_binary(mutations, num_samples, PURITY, args, record, betabinomial):
+def run_coordinator_binary(mutations, model, sample_ids, num_samples, PURITY, args, record, betabinomial):
     L, R, maxit, prefix, restarts, ubleft, J = unpck(args)
+    # results[V] = best run_descent result for V clusters; its objective is results[V][4]
     results = {}
+    obj = (lambda V : results[V][4])
     def evaluate(V):
         if V not in results:
             sys.stderr.write('[{:%Y-%b-%d %H:%M:%S}]'.format(datetime.datetime.now()) + 'Computing for {} clusters...\n'.format(V))
-            results[V] = run(mutations, num_samples, V, maxit, prefix, PURITY, restarts, ubleft, J, record, betabinomial)
-        sys.stderr.write('[{:%Y-%b-%d %H:%M:%S}]'.format(datetime.datetime.now()) + 'Objective for {} clusters: {}\n'.format(V, results[V][-1]))
+            results[V] = run(model, num_samples, V, maxit, PURITY, restarts, J, record, args['debug'], args['convergence'])
+        sys.stderr.write('[{:%Y-%b-%d %H:%M:%S}]'.format(datetime.datetime.now()) + 'Objective for {} clusters: {}\n'.format(V, obj(V)))
         return
 
     MAXR = R
@@ -390,53 +421,68 @@ def run_coordinator_binary(mutations, num_samples, PURITY, args, record, betabin
         M = int(math.floor(float(R + L) / 2.0))
         assert M not in {L, R}
         evaluate(M)
-        if float(results[M][-1] - results[MAXR][-1]) / abs(results[MAXR][-1]) > ubleft:
+        if float(obj(M) - obj(MAXR)) / abs(obj(MAXR)) > ubleft:
             L = M
         else:
             R = M
 
     evaluate(L)
     evaluate(R)
-    selected = L if float(results[L][-1] - results[MAXR][-1]) / abs(results[MAXR][-1]) <= ubleft else R
-    C, bmut, clus, conf, objs = results[selected]
-    write_results(prefix, C, clus, conf, bmut, PURITY, betabinomial, 'CCF' if args['ccf'] else 'DCF')
-    #write_results_decifer_format(bmut, clus, prefix, selected, num_samples, C)
+    selected = L if float(obj(L) - obj(MAXR)) / abs(obj(MAXR)) <= ubleft else R
+    sys.stderr.write('Selected number of clusters: {}\n'.format(selected))
+    finalize_k(mutations, model, results[selected], sample_ids, num_samples, PURITY, args, betabinomial, selected)
 
 
-def run(mutations, num_samples, K, maxit, prefix, PURITY, restarts, ubleft, J, record, betabinomial):
+def run(model, num_samples, K, maxit, PURITY, restarts, J, record, debug, convergence):
+    # returns the run_descent result with the best objective across restarts for K clusters
     jobs = [(x, K, np.random.randint(low=0, high=2**10)) for x in range(restarts)]
-    manager, shared = setup_shared()
-    initargs = (mutations, num_samples, maxit, shared, record, betabinomial, PURITY)
-    pool = Pool(processes=min(J, len(jobs)), initializer=init_descent, initargs=initargs)
-    bar = ProgressBar(total=len(jobs), length=30, verbose=False, lock=Lock(), counter=Value('i', 0))
-    bar.progress(advance=False, msg="Started")
-    report = (lambda r : bar.progress(advance=True, msg="Completed {} for k={} [Iterations: {}]".format(r[0], r[1], r[3])))
-    map(report, pool.imap_unordered(run_descent, jobs))
-    best = min(jobs, key=(lambda j : shared['objs'][j]))
-    C, bmut, clus, conf, objs = map(lambda D : shared[D][best], ['C', 'bmut', 'clus', 'conf', 'objs'])
-    return C, bmut, clus, conf, objs
+    # in --debug mode the jobs re-seed the random generators of this process: restore them so that the
+    # seeds drawn for the next number of clusters are the same as when the jobs run in a pool
+    states = (np.random.get_state(), rand.getstate())
+    results = run_descents(jobs, model, num_samples, maxit, record, PURITY, J, debug, convergence)
+    np.random.set_state(states[0])
+    rand.setstate(states[1])
+    return results[min(jobs, key=(lambda j : results[j][4]))]
 
 
-def setup_shared():
-    manager = Manager()
-    shared = {}
-    shared['C'] = manager.dict()
-    shared['bmut'] = manager.dict()
-    shared['clus'] = manager.dict()
-    shared['conf'] = manager.dict()
-    shared['objs'] = manager.dict()
-    return manager, shared
+def run_descents(jobs, model, num_samples, maxit, record, purity, J, debug, convergence):
+    # runs the coordinate descent of every job (restart, k, seed); returns {job : run_descent(job)}
+    initargs = (model, num_samples, maxit, record, purity, convergence)
+    if debug:
+        # run in single-thread mode for development/debugging
+        init_descent(*initargs)
+        return {job : run_descent(job) for job in jobs}
+    results = {}
+    with Pool(processes=min(J, len(jobs)), initializer=init_descent, initargs=initargs) as pool:
+        bar = ProgressBar(total=len(jobs), length=30, verbose=False, lock=Lock(), counter=Value('i', 0))
+        bar.progress(advance=False, msg="Started")
+        for r in pool.imap_unordered(run_descent, jobs):
+            bar.progress(advance=True, msg="Completed {} for k={} [Iterations: {}]".format(r[0], r[1], r[3]))
+            results[r[:3]] = r
+    return results
 
 
-def init_descent(_mutations, _num_samples, _maxit, _shared, _record, _betabinomial, _purity):
-    global gmutations, num_samples, maxit, shared, record, betabinomial, purity
-    gmutations = _mutations
+def unpack_result(mutations, result):
+    # returns C, mutations with the assignments of a run_descent result, cluster and genotype tree assignments, objective
+    C, clus, cfg = result[5], result[6].tolist(), result[7].tolist()
+    # shallow copies are enough: only the assignments and PASS flag of a copy are ever modified
+    bmut = []
+    for m, cl, cf in zip(mutations, clus, cfg):
+        m = copy(m)
+        m.assigned_cluster = cl
+        m.assigned_config = m.configs[cf]
+        bmut.append(m)
+    return C, bmut, clus, [m.assigned_config for m in bmut], result[4]
+
+
+def init_descent(_model, _num_samples, _maxit, _record, _purity, _convergence):
+    global gmodel, num_samples, maxit, record, purity, convergence
+    gmodel = _model
     num_samples = _num_samples
     maxit = _maxit
-    shared = _shared
     record = _record
-    betabinomial = _betabinomial
     purity = _purity
+    convergence = _convergence
 
 
 def run_descent(job):
@@ -444,17 +490,11 @@ def run_descent(job):
         x, k, seed = job
         rand.seed(seed)
         np.random.seed(seed)
-        mutations = deepcopy(gmutations)
         #with warnings.catch_warnings() as w:
         #   warnings.simplefilter("ignore")
         np.seterr(all='warn')
-        C, best_mutations, mut_cluster_assignments, mut_config_assignments, obj, it = coordinate_descent(x, seed, mutations, num_samples, k, maxit, record, betabinomial, PURITY)
-        shared['C'][job] = C
-        shared['bmut'][job] = best_mutations
-        shared['clus'][job] = mut_cluster_assignments
-        shared['conf'][job] = mut_config_assignments
-        shared['objs'][job] = obj
-        return job + (it, obj)
+        C, clus, cfg, obj, it = coordinate_descent(x, seed, gmodel, num_samples, k, maxit, record, PURITY, convergence)
+        return job + (it, obj, C, clus, cfg)
     except:
         # Put all exception text into an exception and raise that
         raise Exception("".join(traceback.format_exception(*sys.exc_info())))

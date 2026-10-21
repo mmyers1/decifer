@@ -5,7 +5,6 @@ author: gsatas
 date: 2020-05-04
 """
 
-from decifer.new_coordinate_ascent import compute_pdfs
 import numpy as np
 import pandas as pd
 
@@ -56,8 +55,11 @@ def read_purity(purity_file):
             PURITY[int(line[0])] = float(line[1])
     return PURITY
 
-def write_results(prefix, C, CIs, mut_config_assignments, mutations, purity, bb, kind, printallk, k):
+def write_results(prefix, C, CIs, mut_config_assignments, mutations, purity, bb, kind, printallk, k, model):
+    # model: fastmodel.Model of the input mutations, used for the likelihood of each mutation in each cluster
     clust_center_scaled = (lambda sam, clust: C[sam][clust]/purity[sam])
+    # cluster_nll[i][cl] = -log likelihood of mutation i in cluster cl with its best genotype tree (inf if infeasible)
+    cluster_nll = model.mutation_cluster_nll(C)
     # CIs do not need to be rescaled by purity as they alrady are during CI function within __main__
     if printallk:
         name = f"{prefix}_output_K{k}.tsv"
@@ -96,13 +98,9 @@ def write_results(prefix, C, CIs, mut_config_assignments, mutations, purity, bb,
 
             explained = []
             lhs = []
+            mut_nll = cluster_nll[model.index_of[mut.index]]
             for cl in range(len(C[0])):
-                if bb is None:
-                    form = (lambda cf, sam : (cf.cf_to_v(C[sam][cl], sam), mut.a[sam]+1, (mut.d[sam] - mut.a[sam]) + 1))
-                else:
-                    form = (lambda cf, sam : (cf.cf_to_v(C[sam][cl], sam), mut.a[sam], mut.d[sam] - mut.a[sam], bb[sam]))
-                grow = (lambda sample : compute_pdfs(*zip(*[form(cb, sample) for cb in mut.configs])))
-                best = np.min(-np.sum(np.array([grow(sample) for sample in range(len(C))]), axis=0))
+                best = mut_nll[cl]
                 if best < np.inf:
                     explained.append(cl)
                     lhs.append(best)

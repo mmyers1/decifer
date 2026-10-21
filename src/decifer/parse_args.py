@@ -27,6 +27,7 @@ def parse_args():
     parser.add_argument("-K","--maxk", type=int, required=False, default=12, help="Maximum number of clusters (default: 12)")
     parser.add_argument("-r","--restarts", type=int, required=False, default=20, help="Number of restarts (default: 20)")
     parser.add_argument("-t","--maxit", type=int, required=False, default=200, help="Maximum number of iterations per restart (default: 200)")
+    parser.add_argument("--convergence", type=str, required=False, default="assignments", choices=["assignments", "objective"], help="Stopping rule of each restart: 'assignments' stops when the cluster and state-tree assignments of all SNVs no longer change (as in Satas et al., 2021); 'objective' stops when the objective changes by less than 1e-3 over one iteration (DeCiFer <= v2.1.4) (default: assignments)")
     parser.add_argument("-e","--elbow", type=float, required=False, default=0.06, help="Elbow sensitivity, lower values increase sensitivity (default: 0.06)")
     parser.add_argument("--binarysearch", required=False, default=False, action='store_true', help='Use binary-search model selection (default: False, iterative is used; use binary search when considering large numbers of clusters')
     parser.add_argument("--record", required=False, default=False, action='store_true', help='Record objectives (default: False)')
@@ -75,6 +76,7 @@ def parse_args():
         "mink" : args.mink,
         "maxk" : args.maxk,
         "maxit" : args.maxit,
+        "convergence" : args.convergence,
         "purity" : args.purityfile,
         "restarts" : args.restarts,
         "elbow" : args.elbow,

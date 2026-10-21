@@ -47,7 +47,7 @@ def fit_betabinom(args):
     overlap, tot, sel = get_overlap(baf, snps, args['J'])
     sys.stderr.write('The number of retained SNPs is {} over a total of {} SNPs ({:.2%})\n'.format(sel, tot, sel / float(tot)))
     sys.stderr.write('> Fitting Beta-Binomial\n')
-    betabinom = fit(baf, overlap, samples, args['restarts'], args['skip'], args['J'])
+    betabinom = fit(baf, overlap, samples, args['restarts_bb'], args['skip'], args['J'])
     """
     with open(f"{args['output']}_betabinom.tsv", 'w') as out:
         out.write('#SAMPLE\tPRECISION\tNLH\n')
@@ -60,7 +60,17 @@ def fit_betabinom(args):
     sys.stderr.write('> Plotting beta-binomial fit\n')
     plot_betabinomial(overlap, baf, snps, samples, betabinom)
     return betabinom
-    
+
+
+def main():
+    # fitbeta: fit the beta-binomial precision of every sample and write PREFIXbetabinom.tsv
+    args = parse_args()
+    betabinom = fit_betabinom(args)
+    with open('{}betabinom.tsv'.format(args['output']), 'w') as out:
+        out.write('#SAMPLE\tPRECISION\tNLH\n')
+        for sam in sorted(betabinom):
+            out.write('\t'.join(map(str, [sam, betabinom[sam][0], betabinom[sam][1]])) + '\n')
+
 
 def parse_args():
     description = "DeCiFer."
@@ -89,7 +99,7 @@ def parse_args():
         "snpfile" : args.snpfile,
         "threshold" : args.sensitivity,
         "J" : args.jobs,
-        "restarts" : args.restarts,
+        "restarts_bb" : args.restarts,
         "skip" : args.skip,
         "output" : args.output
     }

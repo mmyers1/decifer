@@ -31,6 +31,8 @@ def test_end2end():
                     "-j", j,
                     "-o", test_out,
                     "--vafdevfilter", vafdevfilter,
+                    # stopping rule of DeCiFer <= v2.1.4, with which the truth was generated
+                    "--convergence", "objective",
                     "--debug"])
 
     """
@@ -41,6 +43,18 @@ def test_end2end():
                         check_less_precise=3)
     """
 
-    test_df = pd.read_csv(f"{test_out}_clusterCIs.tsv", "\t", skiprows=3)
-    truth_df = pd.read_csv(f"{this_dir}/data/decifer_clusterCIs.tsv", "\t", skiprows=3)
+    test_df = pd.read_csv(f"{test_out}_clusterCIs.tsv", sep="\t", skiprows=3)
+    truth_df = pd.read_csv(f"{this_dir}/data/decifer_clusterCIs.tsv", sep="\t", skiprows=3)
     assert_frame_equal(test_df, truth_df)
+
+
+def test_binarysearch(tmp_path):
+    # binary-search model selection runs end to end and writes the cluster CIs and SNV outputs
+    prefix = str(tmp_path / "decifer")
+    out = subprocess.run(["decifer", f"{this_dir}/data/decifer_input.tsv",
+                    "-p", f"{this_dir}/data/purity.tsv",
+                    "-k", "5", "-K", "8", "-r", "3", "--seed", "17", "-j", "2",
+                    "--binarysearch", "--debug", "-o", prefix])
+    assert out.returncode == 0
+    for name in ["output", "clusterCIs"]:
+        assert os.path.getsize(f"{prefix}_{name}.tsv") > 0

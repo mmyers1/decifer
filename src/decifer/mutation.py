@@ -131,8 +131,11 @@ def create_mutations(mutation_data, state_trees, dcf_mode=True):
     # From a mutation data file, create mutation dict of Mutation objects
     mutations = {}
 
-    for idx in mutation_data.index:
-        line = mutation_data.loc[idx]
+    # 6 columns for SNV info (sample index/label, character index/label, REF counts, ALT counts)
+    # remainder of columns for copy number states, each state having 3 columns
+    num_CNstates = (len(mutation_data.columns) - 6)//3
+    # iterate over rows as dicts (much faster than mutation_data.loc[idx] for every row)
+    for idx, line in zip(mutation_data.index, mutation_data.to_dict('records')):
         label = line['character_label']
         index = line['character_index']
         ref = int(line['ref'])
@@ -140,9 +143,6 @@ def create_mutations(mutation_data, state_trees, dcf_mode=True):
         d = a + ref
         sample = int(line['#sample_index'])
 
-        # 6 columns for SNV info (sample index/label, character index/label, REF counts, ALT counts)
-        # remainder of columns for copy number states, each state having 3 columns
-        num_CNstates = (len(mutation_data.columns) - 6)//3
         CNs = [] # list of tuples of allele-specific copy numbers
         mus = [] # list of clone proportions
         for i in range(num_CNstates):

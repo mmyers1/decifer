@@ -68,6 +68,9 @@ def filter_MUTATION_DF(MUTATION_DF, PURITY):
     MUTATION_DF = MUTATION_DF.replace({"#sample_index": recode_dict})
     return MUTATION_DF, purity_new
 
+# read input mutation data, store as pd.DataFrame
+MUTATION_DF = read_input_file(args["input"])
+
 # Read/calculate purity information
 if args['purity'] is not None:
     PURITY = read_purity(args['purity'])
@@ -78,9 +81,6 @@ else:
 for sample in PURITY:
     if PURITY[sample] <= 0.0 or PURITY[sample] > 1.0:
         sys.stderr.write(f"WARNING: sample with index {sample} has purity of zero, negative, or greater than one, and will be removed\n")
-
-# read input mutation data, store as pd.DataFrame
-MUTATION_DF = read_input_file(args["input"])
 
 # filter samples with inappropriate PURITY values
 # update PURITY dict to reflect re-indexed samples

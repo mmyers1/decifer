@@ -15,13 +15,19 @@ from scipy.special import gammaln
 from scipy.optimize import minimize_scalar
 import time
 
+from decifer.fastmodel import EPSILON, SEQERROR
+
 
 TOLERANCE = 1e-03
-EPSILON = -1e40
-SEQERROR = 1e-40
 
 
-def coordinate_descent(restart, seed, mutations, num_samples, num_clusters, MAX_IT=5, record=None, bb=None, purity=None):
+def coordinate_descent(restart, seed, model, num_samples, num_clusters, MAX_IT=5, record=None, purity=None, convergence='assignments'):
+    # model is a fastmodel.Model built from the mutations; assignments are kept as integer arrays:
+    # clus[i] is the cluster of mutation i and cfg[i] the index of its genotype tree in mutation.configs
+    # convergence: 'assignments' stops when the cluster and genotype-tree assignments of all mutations are
+    # unchanged between two consecutive iterations (Satas et al., 2021); 'objective' stops when the objective
+    # changed less than TOLERANCE over the last iteration (DeCiFer <= v2.1.4)
+    assert convergence in {'assignments', 'objective'}, 'Unknown convergence criterion: {}'.format(convergence)
 
     # initialize cluster centers C; a list of lists, where each list is the cluster centers for a sample:
     # [absent, truncal, sample specific clusters (truncal if sample index, 0 otherwise),
@@ -40,108 +46,90 @@ def coordinate_descent(restart, seed, mutations, num_samples, num_clusters, MAX_
     C = [ form(np.random.uniform(low=0.0, high=purity[sam], size=rest) if rest > 0 else [], sam) for sam in range(num_samples) ]
     for sam in range(len(C)):
         assert np.all( np.array(C[sam]) <= purity[sam] ), 'out of bounds!'
+    # every mutation starts in cluster 0 with its first genotype tree
+    clus = np.zeros(model.num_mutations, dtype=np.int64)
+    cfg = np.zeros(model.num_mutations, dtype=np.int64)
     V, C_old, V_old = None, None, None
     IT = 0
     objs = []
+    objectives = ClusterObjectives(model, purity)
 
-    # convergence if the difference between the last and 3rd-to-last objective less than TOLERANCE
+    # objective criterion: the difference between the last and 3rd-to-last objective less than TOLERANCE
     isconverged = (lambda O : False if len(O) < 3 else abs(O[-1] - O[-3]) < TOLERANCE)
-    while not isconverged(objs) and IT < MAX_IT:
-        mutations, obj = optimize_assignments(mutations, C, num_samples, num_clusters, bb)
+    converged = False
+    while not converged and IT < MAX_IT:
+        clus_old, cfg_old = clus, cfg
+        clus, cfg, obj = optimize_assignments(model, C, clus, cfg)
         assert len(objs) == 0 or obj - objs[-1] <= TOLERANCE, 'Objective is not decreasing after assignments: {}'.format(objs + [obj])
         objs.append(obj)
-        C_old, V_old = C, update_objs(C, mutations, num_samples, num_clusters, bb)
-        C, V, obj = optimize_cluster_centers(mutations, num_samples, C_old, V_old, num_clusters, bb, purity)
+        if convergence == 'assignments' and IT > 0 and np.array_equal(clus, clus_old) and np.array_equal(cfg, cfg_old):
+            # unchanged assignments give unchanged centers for all non-empty clusters: C and the
+            # assignments are final
+            converged = True
+            break
+        C_old, V_old = C, update_objs(model, C, clus, cfg, num_samples, num_clusters, objectives)
+        C, V, obj = optimize_cluster_centers(model, clus, cfg, num_samples, C_old, V_old, num_clusters, purity, objectives)
         assert len(objs) == 0 or obj - objs[-1] <= TOLERANCE, 'Objective is not decreasing after centers: {}'.format(objs + [obj])
         objs.append(obj)
         IT += 1
-    #C[0][5] = 0.0
-    mutations, obj = optimize_assignments(mutations, C, num_samples, num_clusters, bb, last=True)
-    assert len(objs) == 0 or obj - objs[-1] <= TOLERANCE, 'Objective is not decreasing after assignments: {}'.format(objs + [obj])    
-    objs.append(obj)
-    
-    mut_cluster_assignments = [m.assigned_cluster for m in mutations]
-    mut_config_assignments = [m.assigned_config for m in mutations]
+        if convergence == 'objective':
+            converged = isconverged(objs)
+    if not (converged and convergence == 'assignments'):
+        clus, cfg, obj = optimize_assignments(model, C, clus, cfg)
+        assert len(objs) == 0 or obj - objs[-1] <= TOLERANCE, 'Objective is not decreasing after assignments: {}'.format(objs + [obj])
+        objs.append(obj)
+
     if record is not None:
         for x, obj in enumerate(objs):
             record.append((num_clusters, restart, seed, x, obj))
-    return C, mutations, mut_cluster_assignments, mut_config_assignments, objs[-1], IT
+    return C, clus, cfg, objs[-1], IT
 
 
-def optimize_assignments(mutations, C, num_samples, num_clusters, bb, last=False):
-
-    def select(m):
-        # m in a single element from mutations
-        # each element of m.configs list is Config object for a particular cn_state, cn_prop
-        # this information, along with the cluster ID, is used to convert to and from DCF/CCF <-> VAF
-        # here, combs list of tuples (config, cluster) allows us to iterate through each genotype tree and
-        # cluster, to assign the combo that has the highest likelihood
-
-        combs = [(config, clust) for config in m.configs for clust in range(num_clusters)]        
-        # form returns a 3-tuple (VAF, a, d-a), where
-        # VAF is computed by converting from DCF/CCF cluster center for a sample, a is ALT depth, d is total depth
-        if bb is None:
-            form = (lambda cf, cl, sam : (cf.cf_to_v(C[sam][cl], sam), m.a[sam]+1, (m.d[sam] - m.a[sam]) + 1))
-        else:
-            form = (lambda cf, cl, sam : (cf.cf_to_v(C[sam][cl], sam), m.a[sam], m.d[sam] - m.a[sam], bb[sam]))
-        # given a sample, returns log prob of mutation for each cluster???
-        # zip takes list of 3-tuples (asterisk w/in zip makes each tuple separate arg)
-        # zip returns 3 tuples/lists, one for each return value of form lambda: VAF, a, d-a
-        # asterisk preceding zip makes each tuple/list a separate arg for compute_pdfs
-        grow = (lambda sample : compute_pdfs( *zip(*[form(cb[0], cb[1], sample) for cb in combs]) ))
-        # grow(sample) returns array of log prob of mutation (a, d-a) for each cluster
-        # obj is array of summed log prob(mutation) across samples, 1 element for each cluster
-        objs = -np.sum(np.array([grow(sample) for sample in range(num_samples)]), axis=0)
-        # taking minimum of negative log probability maximizes probability, finding best cluster
-        best = objs.argmin()
-        assert objs[best] < np.inf, 'A mutation cannot be assigned to any cluster: {},{}\n\t{}\n'.format(m.index, m.label, map(lambda x : '{},{}'.format(x.mut_state, x.other_states), m.configs)) + str([m.configs[0].cf_bounds(sam) for sam in range(num_samples)]) + '\n' + str([C[sam][1] for sam in range(num_samples)]) + '\n'
-        # compare best
-        found = combs.index((m.assigned_config, m.assigned_cluster))
-        before = -sum(compute_pdfs(*zip(*[form(combs[found][0], combs[found][1], sample) for sample in range(num_samples)])))
-        assert objs[best] <= before, 'Non scende: {}'.format(C)
-        return (float(objs[best]), combs[best][0], combs[best][1])
-
-    def update(m, best):
-        m.assigned_config = best[1]
-        m.assigned_cluster = best[2]
-        for sam in range(num_samples):
-            assert m.assigned_config.cf_bounds(sam)[0] - 0.05 <= C[sam][m.assigned_cluster] <= m.assigned_config.cf_bounds(sam)[1] + 0.05, (C[sam][m.assigned_cluster], m.assigned_config.cf_bounds(sam), m.assigned_config.d_to_lam(C[sam][m.assigned_cluster], sam))
-        return best[0]
-
-    return mutations, sum(map(lambda m : update(m, select(m)), mutations))
+def optimize_assignments(model, C, clus, cfg):
+    # For each mutation, select the (genotype tree, cluster) pair with the highest likelihood given the
+    # cluster centers C; ties are broken by the first pair in (genotype tree, cluster) order
+    nll, best, rows, new_clus = model.best_assignment(C)
+    if not np.all(best < np.inf):
+        i = int(np.argmax(~(best < np.inf)))
+        raise AssertionError('A mutation cannot be assigned to any cluster: {},{}\n\t{}\n'.format(list(model.index_of)[i], model.labels[i], [C[sam][1] for sam in range(model.num_samples)]))
+    # the objective of the current assignment can only improve
+    before = nll[model.row_start[:-1] + cfg, clus]
+    assert np.all(best <= before), 'Non scende: {}'.format(C)
+    # python sum over mutations, in mutation order
+    return new_clus, rows - model.row_start[:-1], sum(best.tolist())
 
 
-def optimize_cluster_centers(mutations, num_samples, C_old, V_old, num_clusters, bb, purity):
-    # given a sample and mutations, minim finds the DCF/CCF cluster center with minimum -log(prob) (ci in objective)
-    # min() function added to enforce respect of purity boundary
-    minim = (lambda muti, sam : min(
-        minimize_scalar(objective, args=(muti, sam, bb), method='bounded', bounds=[0,purity[sam]], options={'xatol' : TOLERANCE}).x,
-        purity[sam]))
-    # getmi reports the DCF/CCF value and the objective value (-log(prob)) for a particular DCF/CCF value (x), returns tuple (DCF/CCF, -log(prob))
-    # minim gets passed as arg for x
-    getmi = (lambda muti, sam, x : (x, objective(x, muti, sam, bb) if len(muti) > 0 else 0.0))
-    # caseg implements getmi, substituting random number for minim cluster center if no mutations
-    caseg = (lambda muti, sam : getmi(muti, sam, minim(muti, sam) if len(muti) > 0 else np.random.uniform(low=0.0, high=purity[sam])))
-    # (i - 2) == sam is true if i is the sample-specific cluster for that sample
-    cases = (lambda muti, sam, i : getmi(muti, sam, minim(muti, sam) if (i - 2) == sam and len(muti) > 0 else 0.0))
-    # cas01 is same as getmi
-    cas01 = (lambda muti, sam, x : (x, objective(x, muti, sam, bb) if len(muti) > 0 else 0.0))
-    # caseb runs cas01 if i in {0,1}, absent or truncal cluster, o.w. runs cases for sample-specific cluster
-    caseb = (lambda muti, sam, i : cas01(muti, sam, 0.0 if i == 0 else purity[sam]) if i in {0, 1} else cases(muti, sam, i))
-
-    # obj_i runs caseb if cluster is absent, truncal, or sample specific, o.w. runs caseg
-    obj_i = (lambda muti, sam, i : caseb(muti, sam, i) if i < 2 + num_samples else caseg(muti, sam))
-    selec = (lambda sam, i, R : (C_old[sam][i], V_old[sam][i]) if V_old[sam][i] < R[1] else R)
-    # R_sam goes through all clusters, and using the mutations assigned to a cluster, executes obj_i,
-    # which finds the cluster value with the minimum -log(prob), using the selec function to choose the previous cluster
-    # value if it has lower objective
-    R_sam = (lambda sam : [selec(sam, i, obj_i(list(filter(lambda m : m.assigned_cluster == i, mutations)), sam, i)) for i in range(num_clusters)])
-    R_new = [R_sam(sam) for sam in range(num_samples)]
-    C_new, V_new = map(list, zip(*[map(list, zip(*r)) for r in R_new]))
+def optimize_cluster_centers(model, clus, cfg, num_samples, C_old, V_old, num_clusters, purity, objectives):
+    # For each sample and cluster, find the DCF/CCF cluster center with minimum -log(prob) given the
+    # mutations assigned to the cluster, keeping the previous center if it has a lower objective.
+    # Cluster 0 (absent) and 1 (truncal) are fixed; clusters 2..num_samples+1 are sample specific and
+    # optimized only in their own sample (0 elsewhere); the remaining clusters are optimized in every
+    # sample, or re-initialized at random when empty.
+    rows = model.row_start[:-1] + cfg
+    members = [rows[clus == i] for i in range(num_clusters)]
+    C_new, V_new = [], []
+    for sam in range(num_samples):
+        C_sam, V_sam = [], []
+        for i in range(num_clusters):
+            nonempty = len(members[i]) > 0
+            if i in {0, 1}:
+                x = 0.0 if i == 0 else purity[sam]
+            elif i < 2 + num_samples:
+                x = objectives.minimum(sam, i, members[i]) if (i - 2) == sam and nonempty else 0.0
+            else:
+                x = objectives.minimum(sam, i, members[i]) if nonempty else np.random.uniform(low=0.0, high=purity[sam])
+            v = objectives.value(sam, i, members[i], x) if nonempty else 0.0
+            if V_old[sam][i] < v:
+                x, v = C_old[sam][i], V_old[sam][i]
+            C_sam.append(x)
+            V_sam.append(v)
+        C_new.append(C_sam)
+        V_new.append(V_sam)
     return C_new, V_new, sum(el for r in V_new for el in r)
 
 
 def objective(ci, muti, sample, bb):
+    # scalar reference implementation of fastmodel.Model.objective_fn, on Mutation objects
     if bb is None:
         form = (lambda mut : (mut.assigned_config.cf_to_v(ci, sample), mut.a[sample] + 1, (mut.d[sample] - mut.a[sample]) + 1))
     else:
@@ -150,10 +138,45 @@ def objective(ci, muti, sample, bb):
     return -EPSILON if np.any(np.isneginf(pdfs)) else -np.sum(pdfs)
 
 
-def update_objs(C, mutations, num_samples, num_clusters, bb):
-    iobj = (lambda sam, muti, c : objective(c, muti, sam, bb) if len(muti) > 0 else 0.0)
-    comp = (lambda sam, i : iobj(sam, list(filter(lambda m : m.assigned_cluster == i, mutations)), C[sam][i]))
-    return [[comp(sam, i) for i in range(num_clusters)] for sam in range(num_samples)]
+def update_objs(model, C, clus, cfg, num_samples, num_clusters, objectives):
+    rows = model.row_start[:-1] + cfg
+    members = [rows[clus == i] for i in range(num_clusters)]
+    iobj = (lambda sam, i : objectives.value(sam, i, members[i], C[sam][i]) if len(members[i]) > 0 else 0.0)
+    return [[iobj(sam, i) for i in range(num_clusters)] for sam in range(num_samples)]
+
+
+class ClusterObjectives:
+    """
+    Objective (fastmodel.Model.objective_fn) of the mutations assigned to each (sample, cluster). The
+    objective of a cluster depends only on its members and center, so its values and its minimizer
+    (minimize_scalar is deterministic) are memoized and reused while the members are unchanged.
+    """
+
+    def __init__(self, model, purity):
+        self.model = model
+        self.purity = purity
+        # (sample, cluster) -> (rows of the members, objective function, {center : value}, [minimizer])
+        self.entries = {}
+
+    def _entry(self, sam, i, rows):
+        entry = self.entries.get((sam, i))
+        if entry is None or not np.array_equal(entry[0], rows):
+            entry = self.entries[(sam, i)] = (rows, self.model.objective_fn(sam, rows), {}, [])
+        return entry
+
+    def value(self, sam, i, rows, c):
+        _, f, values, _ = self._entry(sam, i, rows)
+        key = float(c)
+        if key not in values:
+            values[key] = f(c)
+        return values[key]
+
+    def minimum(self, sam, i, rows):
+        # cluster center with minimum objective; min() enforces the purity boundary
+        _, f, _, argmin = self._entry(sam, i, rows)
+        if not argmin:
+            argmin.append(min(minimize_scalar(f, method='bounded', bounds=[0, self.purity[sam]], options={'xatol' : TOLERANCE}).x, self.purity[sam]))
+        return argmin[0]
 
 
 def compute_pdfs(_VS, _AS, _BS, _BB=None, check=False):
@@ -164,7 +187,7 @@ def compute_pdfs(_VS, _AS, _BS, _BB=None, check=False):
          VS, AS, BS, BB = map(np.array, [_VS, _AS, _BS, _BB])
      VS[VS < SEQERROR] = SEQERROR
      VS[VS > (1.0 - SEQERROR)] = 1.0 - SEQERROR
-     RS = np.full(M.shape[0], np.NINF)
+     RS = np.full(M.shape[0], -np.inf)
      if _BB is None:
         """
         x = beta.logpdf(VS[M], AS[M], BS[M])
@@ -188,6 +211,6 @@ def compute_pdfs(_VS, _AS, _BS, _BB=None, check=False):
          RS[M] = CS + betaln(KS + SS * BAFS, NSminusKS + SS * minusBAFS) - betaln(SS * BAFS, SS * minusBAFS)
      RS[M & (RS < EPSILON)] = EPSILON
      if check:
-         assert np.NINF not in RS[M]
+         assert -np.inf not in RS[M]
      return RS
 
