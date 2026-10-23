@@ -61,8 +61,18 @@ decifer/src/decifer/mutation.py:158: UserWarning: Skipping mutation ###: State t
 While the state tree file we provide should accomodate many users, there could be exceptions. If you observe this message for many SNV sites, you may generate a state tree file that is tailored to the CN states and subclones observed in your data using the following command:
 
 ```
-generatestatetrees cn_states.txt > my_state_trees.txt
+generatestatetrees -threads 4 cn_states.txt > my_state_trees.txt
 ```
 
-Where the `cn_states.txt` is the output file mentioned above and `my_state_trees.txt` is any file name of your choosing to store the state trees. Then, re-run decifer using the `--statetrees my_state_trees.txt` option, specifying the state tree file you just created. Please note that, when generating the `cn_states.txt` with `vcf_2_decifer.py`, if the value used for `MAX_CN` is greater than 6, the `generatestatetrees` function may take a very long time.
+Where the `cn_states.txt` is the output file mentioned above and `my_state_trees.txt` is any file name of your choosing to store the state trees. Then, re-run decifer using the `--statetrees my_state_trees.txt` option, specifying the state tree file you just created.
+
+`generatestatetrees` has several exact enumeration algorithms (`-algorithm`), which all give the same output as the original enumeration (`legacy`):
+- `tree`: the original enumeration of state graph subtrees, with pruning;
+- `flashlight`: enumerates the state trees directly, checking each partial decision with a feasibility oracle;
+- `frontier`: a dynamic program over the lattice of copy-number states, fastest when one of the two alleles has few copies;
+- `auto` (default): runs `tree`, `flashlight` and `frontier` concurrently on each set of copy-number states and keeps the first result (three threads per set).
+
+`-threads N` processes N sets of copy-number states in parallel (so `auto` uses 3N threads). `-frontierLimit` bounds the memory of the dynamic program (default 2,000,000 states per step, about 1 GB). `-stats` reports the time and search statistics of each set.
+
+The run time depends on the largest copy number and on the number of copy-number states in a set. The provided state tree file (469 sets, copy numbers up to 6) takes about 1 second. With copy numbers up to 10, sets of 2–3 states usually take seconds. Sets of 4–5 states in which both alleles have 6 or more copies can take much longer: in a benchmark of 90 sets resembling one locus (a clonal state with 6–10 copies plus nearby subclonal states), 57 finished within 10 seconds each, and most of the others had 4–5 states. If a few sets take too long, exclude the sites with the highest copy numbers (`MAX_CN` in `vcf_2_decifer.py`).
 

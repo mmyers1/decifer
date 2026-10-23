@@ -29,6 +29,9 @@ set( generatestatetrees_src/cpp
   readmatrix.cpp
   basematrix.cpp
   solver.cpp
+  enumerator.cpp
+  flashlight.cpp
+  frontier.cpp
 )
 
 set( generatestatetrees_hdr
@@ -39,6 +42,9 @@ set( generatestatetrees_hdr
   readmatrix.h
   basematrix.h
   solver.h
+  enumerator.h
+  flashlight.h
+  frontier.h
 )
 
 set( LIBLEMON_ROOT "$ENV{HOME}/lemon" CACHE PATH "Additional search directory for lemon library" )

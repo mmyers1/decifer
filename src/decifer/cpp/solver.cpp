@@ -8,6 +8,7 @@
 #include "solver.h"
 #include "stategraph.h"
 #include <iomanip>
+#include <cmath>
 
 Solver::Solver(const ReadMatrix& R,
                int k,
@@ -103,7 +104,7 @@ void Solver::initPWLA()
               double likelihood = getLogLikelihood(var_ip, ref_ip, h);
 //              assert(!isinf(likelihood));
 //              assert(!isnan(likelihood));
-              if (likelihood < infeasible_log || isnan(likelihood) || isinf(likelihood))
+              if (likelihood < infeasible_log || std::isnan(likelihood) || std::isinf(likelihood))
               {
                 _hatG[i][t][j][p][alpha] = infeasible_log;//log(g_tol.epsilon());
               }

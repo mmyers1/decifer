@@ -216,7 +216,25 @@ private:
 public:
   static const StateEdgeSetSet& getStateTrees(const IntPairSet& L,
                                               int xy_max_c);
-  
+
+  /// Return whether the state trees of L have been computed or read
+  ///
+  /// @param L Copy number states
+  static bool hasStateTrees(const IntPairSet& L)
+  {
+    return _dict.count(L) > 0;
+  }
+
+  /// Store the state trees of L
+  ///
+  /// @param L Copy number states
+  /// @param trees State trees
+  static void addStateTrees(const IntPairSet& L,
+                            const StateEdgeSetSet& trees)
+  {
+    _dict[L] = trees;
+  }
+
   static void writeStateTrees(std::ostream& out);
   
   static void readStateTrees(std::istream& in);

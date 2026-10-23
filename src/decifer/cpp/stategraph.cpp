@@ -13,19 +13,19 @@ StateGraph::Dictionary StateGraph::_dict = StateGraph::Dictionary();
 const StateGraph::StateEdgeSetSet& StateGraph::getStateTrees(const IntPairSet& L,
                                                              int maxCopyNumber)
 {
-  int max_x = 0;
-  int max_y = 0;
-  for (const IntPair& xy : L)
-  {
-    max_x = std::max(max_x, xy.first);
-    max_y = std::max(max_y, xy.second);
-  }
-  
-  StateGraph G(max_x, max_y);
-//  G.writeDOT(std::cout);
-  
   if (_dict.find(L) == _dict.end())
   {
+    int max_x = 0;
+    int max_y = 0;
+    for (const IntPair& xy : L)
+    {
+      max_x = std::max(max_x, xy.first);
+      max_y = std::max(max_y, xy.second);
+    }
+
+    StateGraph G(max_x, max_y);
+//    G.writeDOT(std::cout);
+
     G.enumerate(L);
     _dict[L] = G._result;
   }
